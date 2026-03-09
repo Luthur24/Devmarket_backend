@@ -5,3 +5,4 @@ pyjwt
 bcrypt
 cloudinary
 python-dotenv
+gunicorn
