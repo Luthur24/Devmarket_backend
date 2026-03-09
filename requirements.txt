@@ -1,0 +1,7 @@
+flask
+flask-cors
+psycopg2-binary
+pyjwt
+bcrypt
+cloudinary
+python-dotenv
