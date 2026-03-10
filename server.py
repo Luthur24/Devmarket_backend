@@ -18,7 +18,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://luthur24.github.io",
+            "https://luthur24.github.io/Devmarket_frontend",
+            "https://devmarket-backend-2j8j.onrender.com"
+        ],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "50 per hour"])
 
@@ -26,10 +36,7 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "5
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://trends_db_7j0m_user:pWD8LVVvyhlTWhNFVxArwz4wyBeUS25n@dpg-d6g84sdm5p6s739m65v0-a/trends_db_7j0m"
-)
+DATABASE_URL = "postgresql://trends_db_7j0m_user:pWD8LVVvyhlTWhNFVxArwz4wyBeUS25n@dpg-d6g84sdm5p6s739m65v0-a.frankfurt-postgres.render.com/trends_db_7j0m"
 
 # Cloudinary Config
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "ddusfl7pi")
