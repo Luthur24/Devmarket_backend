@@ -14,6 +14,9 @@ from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
+import os
+port = int(os.environ.get("PORT", 10000))
+
 
 load_dotenv()
 
@@ -1101,5 +1104,4 @@ def update_profile():
 # ==================== MAIN ====================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
