@@ -5,4 +5,6 @@ pyjwt
 bcrypt
 cloudinary
 python-dotenv
+Flask-Limiter
+stripe
 gunicorn
