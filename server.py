@@ -36,6 +36,7 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "5
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
 
+# CORRECT (external - works from anywhere)
 DATABASE_URL = "postgresql://trends_db_7j0m_user:pWD8LVVvyhlTWhNFVxArwz4wyBeUS25n@dpg-d6g84sdm5p6s739m65v0-a.frankfurt-postgres.render.com/trends_db_7j0m"
 
 # Cloudinary Config
