@@ -243,11 +243,11 @@ def get_current_user():
 
 def upload_media(file, resource_type="auto"):
     try:
-        result = cloudinary.uploader.upload(file, resource_type=resource_type)
+        result = cloudinary.uploader.upload(file, resource_type=resource_type, timeout=120)
         return result["secure_url"]
     except Exception as e:
         print(f"Cloudinary upload error: {e}")
-        return None
+        raise Exception(f"File upload failed: {str(e)}")
 
 # ==================== ROUTES ====================
 
