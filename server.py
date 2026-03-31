@@ -1,1107 +1,1096 @@
-import os
-import jwt
-import bcrypt
-import psycopg2
-import cloudinary
-import cloudinary.uploader
-import stripe
+"""
+DevMarket — Flask Backend
+server.py
+"""
 
-from flask import Flask, request, jsonify, g
-from flask_cors import CORS
+import os
+import uuid
+import json
+import hashlib
+import hmac
+import secrets
+import re
 from datetime import datetime, timedelta
 from functools import wraps
 
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from dotenv import load_dotenv
-import os
-port = int(os.environ.get("PORT", 10000))
+from flask import Flask, request, jsonify, session, send_from_directory
+from flask_cors import CORS
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import cloudinary
+import cloudinary.uploader
 
-
-load_dotenv()
-
-app = Flask(__name__)
-CORS(app, resources={
-    r"/*": {
-        "origins": [
-            "https://luthur24.github.io",
-            "https://luthur24.github.io/Devmarket_frontend",
-            "https://devmarket-backend-2j8j.onrender.com"
-        ],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
-
-limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "50 per hour"])
-
-# ==================== CONFIG ====================
-
-SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
-
-# CORRECT (external - works from anywhere)
-DATABASE_URL = "postgresql://trends_db_7j0m_user:pWD8LVVvyhlTWhNFVxArwz4wyBeUS25n@dpg-d6g84sdm5p6s739m65v0-a.frankfurt-postgres.render.com/trends_db_7j0m"
-
-# Cloudinary Config
-CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "ddusfl7pi")
-CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY", "599965682593626")
-CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "pUcb90_1jtv-rDlHXRRsfDcBK5k")
-
-cloudinary.config(
-    cloud_name=CLOUDINARY_CLOUD_NAME,
-    api_key=CLOUDINARY_API_KEY,
-    api_secret=CLOUDINARY_API_SECRET
+# ──────────────────────────────────────────────
+# APP CONFIG
+# ──────────────────────────────────────────────
+app = Flask(__name__, static_folder=".", static_url_path="")
+app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("FLASK_ENV") == "production",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
 )
 
-# Stripe Config
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "sk_test_your_key_here")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "whsec_your_webhook_secret")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5000")
+CORS(app, supports_credentials=True, origins=os.getenv("ALLOWED_ORIGINS", "*").split(","))
 
-stripe.api_key = STRIPE_SECRET_KEY
+# Cloudinary
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", "ddusfl7pi"),
+    api_key=os.getenv("CLOUDINARY_API_KEY", ""),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET", ""),
+)
 
-# ==================== DATABASE ====================
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/devmarket")
 
+# ──────────────────────────────────────────────
+# DB
+# ──────────────────────────────────────────────
 def get_db():
-    if "db" not in g:
-        g.db = psycopg2.connect(DATABASE_URL)
-        g.cursor = g.db.cursor()
-    return g.cursor
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return conn
 
 
-@app.teardown_appcontext
-def close_db(error):
-    db = g.pop("db", None)
-    if db:
-        db.close()
+def query(sql, params=None, fetch="all"):
+    conn = get_db()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or [])
+                if fetch == "one":
+                    return cur.fetchone()
+                elif fetch == "all":
+                    return cur.fetchall()
+                elif fetch == "none":
+                    return None
+                elif fetch == "lastrow":
+                    return cur.fetchone()
+    finally:
+        conn.close()
 
 
-def init_tables():
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
+def init_db():
+    conn = get_db()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-    tables = [
-        # Users table - added stripe_account_id, total_earnings
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            email VARCHAR(100) UNIQUE NOT NULL,
-            password_hash VARCHAR(255) NOT NULL,
-            avatar_url TEXT,
-            bio TEXT DEFAULT '',
-            stripe_account_id VARCHAR(255),
-            total_earnings DECIMAL(10,2) DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        
-        # Posts table - added file_url, view_count, sales_count
-        """
-        CREATE TABLE IF NOT EXISTS posts (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            title VARCHAR(255) NOT NULL,
-            description TEXT,
-            price DECIMAL(10,2) DEFAULT 0,
-            media_urls TEXT[] DEFAULT '{}',
-            file_url TEXT,
-            tags TEXT[] DEFAULT '{}',
-            view_count INTEGER DEFAULT 0,
-            sales_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        
-        # Comments table with nested replies support
-        """
-        CREATE TABLE IF NOT EXISTS comments (
-            id SERIAL PRIMARY KEY,
-            post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE,
-            text TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        
-        # Votes table
-        """
-        CREATE TABLE IF NOT EXISTS votes (
-            id SERIAL PRIMARY KEY,
-            post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            value INTEGER CHECK (value IN (1, -1)),
-            UNIQUE(post_id, user_id)
-        )
-        """,
-        
-        # Messages table
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            text TEXT NOT NULL,
-            is_read BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        
-        # Purchases table for tracking paid content
-        """
-        CREATE TABLE IF NOT EXISTS purchases (
-            id SERIAL PRIMARY KEY,
-            buyer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
-            amount DECIMAL(10,2) NOT NULL,
-            stripe_payment_intent_id VARCHAR(255),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(buyer_id, post_id)
-        )
-        """,
-        
-        # Notifications table
-        """
-        CREATE TABLE IF NOT EXISTS notifications (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            type VARCHAR(50) NOT NULL,
-            message TEXT NOT NULL,
-            related_id INTEGER,
-            is_read BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    ]
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                first_name VARCHAR(80) NOT NULL,
+                last_name VARCHAR(80) NOT NULL,
+                username VARCHAR(40) UNIQUE NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                bio TEXT,
+                avatar_url TEXT,
+                website VARCHAR(255),
+                github VARCHAR(100),
+                twitter VARCHAR(100),
+                location VARCHAR(100),
+                total_sales INTEGER DEFAULT 0,
+                avg_rating FLOAT DEFAULT 0,
+                stripe_account_id VARCHAR(255),
+                reset_token VARCHAR(255),
+                reset_token_expires TIMESTAMPTZ,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
 
-    for table in tables:
-        cursor.execute(table)
+            CREATE TABLE IF NOT EXISTS listings (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                seller_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title VARCHAR(200) NOT NULL,
+                short_description VARCHAR(200),
+                description TEXT NOT NULL,
+                category VARCHAR(100) NOT NULL,
+                price NUMERIC(10,2) DEFAULT 0,
+                license VARCHAR(50) DEFAULT 'personal',
+                demo_url VARCHAR(500),
+                tags JSONB DEFAULT '[]',
+                features JSONB DEFAULT '[]',
+                images JSONB DEFAULT '[]',
+                file_url TEXT,
+                file_key TEXT,
+                status VARCHAR(20) DEFAULT 'active',
+                total_sales INTEGER DEFAULT 0,
+                review_count INTEGER DEFAULT 0,
+                avg_rating FLOAT DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
 
-    conn.commit()
-    cursor.close()
+            CREATE TABLE IF NOT EXISTS orders (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                listing_id UUID NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+                buyer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                seller_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                amount NUMERIC(10,2) NOT NULL,
+                currency VARCHAR(10) DEFAULT 'USD',
+                status VARCHAR(30) DEFAULT 'completed',
+                stripe_payment_id VARCHAR(255),
+                download_count INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS reviews (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                listing_id UUID NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+                reviewer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
+                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                title VARCHAR(200),
+                body TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(listing_id, reviewer_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS conversations (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_a UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                user_b UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                last_message TEXT,
+                last_message_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(user_a, user_b)
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                sender_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                body TEXT NOT NULL,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS notifications (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                type VARCHAR(50) NOT NULL,
+                message TEXT NOT NULL,
+                related_id UUID,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_listings_seller ON listings(seller_id);
+            CREATE INDEX IF NOT EXISTS idx_listings_category ON listings(category);
+            CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status);
+            CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id);
+            CREATE INDEX IF NOT EXISTS idx_orders_seller ON orders(seller_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+            """)
     conn.close()
+    print("✅ Database initialized")
 
 
-init_tables()
-
-# ==================== AUTH HELPERS ====================
-
-def hash_password(password):
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-
-
-def check_password(password, hashed):
-    return bcrypt.checkpw(password.encode(), hashed.encode())
+# ──────────────────────────────────────────────
+# AUTH HELPERS
+# ──────────────────────────────────────────────
+def hash_password(pw):
+    salt = secrets.token_hex(16)
+    h = hashlib.sha256((salt + pw).encode()).hexdigest()
+    return f"{salt}:{h}"
 
 
-def encode_jwt(user_id):
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.utcnow() + timedelta(days=7)
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-
-
-def decode_jwt(token):
+def verify_password(pw, stored):
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-    except:
-        return None
+        salt, h = stored.split(":", 1)
+        return hmac.compare_digest(h, hashlib.sha256((salt + pw).encode()).hexdigest())
+    except Exception:
+        return False
 
 
-def require_auth(f):
+def login_required(f):
     @wraps(f)
-    def wrapper(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else None
-        
-        if not token:
-            return jsonify({"error": "Unauthorized - No token provided"}), 401
-
-        payload = decode_jwt(token)
-        if not payload:
-            return jsonify({"error": "Unauthorized - Invalid token"}), 401
-
-        g.user_id = payload["user_id"]
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            return jsonify({"error": "Authentication required"}), 401
         return f(*args, **kwargs)
-    return wrapper
+    return decorated
 
 
-def get_current_user():
-    cursor = get_db()
-    cursor.execute("SELECT id, username, email, bio, avatar_url, stripe_account_id, total_earnings FROM users WHERE id=%s", (g.user_id,))
-    user = cursor.fetchone()
-    if user:
-        return {
-            "id": user[0], "username": user[1], "email": user[2], "bio": user[3],
-            "avatar_url": user[4], "stripe_account_id": user[5], "total_earnings": float(user[6] or 0)
-        }
-    return None
+def safe_user(u):
+    if not u:
+        return None
+    return {
+        "id": str(u["id"]),
+        "first_name": u["first_name"],
+        "last_name": u["last_name"],
+        "username": u["username"],
+        "email": u["email"],
+        "bio": u["bio"],
+        "avatar_url": u["avatar_url"],
+        "website": u["website"],
+        "github": u["github"],
+        "twitter": u["twitter"],
+        "location": u["location"],
+        "total_sales": u["total_sales"],
+        "avg_rating": float(u["avg_rating"] or 0),
+        "created_at": u["created_at"].isoformat() if u["created_at"] else None,
+    }
 
-# ==================== CLOUDINARY ====================
 
-def upload_media(file, resource_type="auto"):
-    try:
-        result = cloudinary.uploader.upload(file, resource_type=resource_type, timeout=120)
-        return result["secure_url"]
-    except Exception as e:
-        print(f"Cloudinary upload error: {e}")
-        raise Exception(f"File upload failed: {str(e)}")
-
-# ==================== ROUTES ====================
-
-@app.route("/")
-def health():
-    return jsonify({"status": "DevMarket API running", "version": "1.0.0"})
-
-# ==================== AUTH ROUTES ====================
-
-@app.route("/auth/register", methods=["POST"])
-@limiter.limit("5 per minute")
-def register():
-    data = request.get_json()
-    username = data.get("username", "").strip()
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
-
-    if not username or not email or not password or len(password) < 6:
-        return jsonify({"error": "Missing fields or password too short (min 6 chars)"}), 400
-
-    cursor = get_db()
-    password_hash = hash_password(password)
-
-    try:
-        cursor.execute(
-            "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s) RETURNING id",
-            (username, email, password_hash)
+def format_listing(l, buyer_id=None):
+    if not l:
+        return None
+    d = dict(l)
+    d["id"] = str(d["id"])
+    d["seller_id"] = str(d["seller_id"])
+    d["price"] = float(d["price"] or 0)
+    d["avg_rating"] = float(d["avg_rating"] or 0)
+    for f in ["created_at", "updated_at"]:
+        if d.get(f):
+            d[f] = d[f].isoformat()
+    for f in ["tags", "features", "images"]:
+        if isinstance(d.get(f), str):
+            try:
+                d[f] = json.loads(d[f])
+            except Exception:
+                d[f] = []
+    if buyer_id:
+        order = query(
+            "SELECT id FROM orders WHERE listing_id=%s AND buyer_id=%s",
+            [d["id"], buyer_id],
+            fetch="one",
         )
-        user_id = cursor.fetchone()[0]
-        g.db.commit()
-        
-        token = encode_jwt(user_id)
-        return jsonify({
-            "token": token, 
-            "user_id": user_id,
-            "username": username,
-            "email": email
-        }), 201
-
-    except psycopg2.errors.UniqueViolation:
-        g.db.rollback()
-        return jsonify({"error": "Username or email already exists"}), 409
-    except Exception as e:
-        g.db.rollback()
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/auth/login", methods=["POST"])
-@limiter.limit("10 per minute")
-def login():
-    data = request.get_json()
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
-
-    if not email or not password:
-        return jsonify({"error": "Missing credentials"}), 400
-
-    cursor = get_db()
-    cursor.execute("SELECT id, username, password_hash FROM users WHERE email=%s", (email,))
-    user = cursor.fetchone()
-
-    if not user or not check_password(password, user[2]):
-        return jsonify({"error": "Invalid credentials"}), 401
-
-    token = encode_jwt(user[0])
-    return jsonify({
-        "token": token, 
-        "user_id": user[0],
-        "username": user[1]
-    })
-
-
-@app.route("/auth/me", methods=["GET"])
-@require_auth
-def get_current_user_route():
-    user = get_current_user()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-    return jsonify(user)
-
-# ==================== POSTS ROUTES ====================
-
-@app.route("/posts", methods=["GET"])
-def get_posts():
-    search = request.args.get("search", "").strip()
-    cursor = get_db()
-    
-    # Get current user if authenticated (for vote status)
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else None
-    current_user_id = None
-    if token:
-        payload = decode_jwt(token)
-        if payload:
-            current_user_id = payload["user_id"]
-
-    # Build query with search
-    if search:
-        cursor.execute("""
-            SELECT p.id, p.title, p.description, p.price, p.media_urls, p.tags, 
-                   p.created_at, p.view_count, p.file_url,
-                   u.id, u.username, u.avatar_url,
-                   COALESCE(SUM(v.value), 0) as vote_count
-            FROM posts p
-            JOIN users u ON p.user_id = u.id
-            LEFT JOIN votes v ON p.id = v.post_id
-            WHERE p.title ILIKE %s OR p.description ILIKE %s OR %s = ANY(p.tags)
-            GROUP BY p.id, u.id
-            ORDER BY p.created_at DESC
-        """, (f"%{search}%", f"%{search}%", search))
+        d["has_purchased"] = order is not None
     else:
-        cursor.execute("""
-            SELECT p.id, p.title, p.description, p.price, p.media_urls, p.tags, 
-                   p.created_at, p.view_count, p.file_url,
-                   u.id, u.username, u.avatar_url,
-                   COALESCE(SUM(v.value), 0) as vote_count
-            FROM posts p
-            JOIN users u ON p.user_id = u.id
-            LEFT JOIN votes v ON p.id = v.post_id
-            GROUP BY p.id, u.id
-            ORDER BY p.created_at DESC
-        """)
-
-    rows = cursor.fetchall()
-    result = []
-
-    for r in rows:
-        post_id = r[0]
-        
-        # Check if user voted on this post
-        user_vote = 0
-        if current_user_id:
-            cursor.execute("SELECT value FROM votes WHERE post_id=%s AND user_id=%s", (post_id, current_user_id))
-            vote_row = cursor.fetchone()
-            if vote_row:
-                user_vote = vote_row[0]
-        
-        # Check if user purchased this (for frontend download button)
-        purchased = False
-        if current_user_id:
-            cursor.execute("SELECT id FROM purchases WHERE buyer_id=%s AND post_id=%s", (current_user_id, post_id))
-            if cursor.fetchone():
-                purchased = True
-
-        # Get comment count
-        cursor.execute("SELECT COUNT(*) FROM comments WHERE post_id=%s", (post_id,))
-        comment_count = cursor.fetchone()[0]
-
-        result.append({
-            "id": post_id,
-            "title": r[1],
-            "description": r[2],
-            "price": float(r[3]),
-            "media_urls": r[4] or [],
-            "tags": r[5] or [],
-            "created_at": r[6].isoformat() if r[6] else None,
-            "view_count": r[7] or 0,
-            "file_url": r[8],
-            "vote_count": int(r[12]),
-            "user_vote": user_vote,
-            "purchased": purchased,
-            "comment_count": comment_count,
-            "user": {
-                "id": r[9],
-                "username": r[10],
-                "avatar_url": r[11]
-            }
-        })
-
-    return jsonify(result)
+        d["has_purchased"] = False
+    return d
 
 
-@app.route("/posts/<int:post_id>", methods=["GET"])
-def get_post(post_id):
-    cursor = get_db()
-    
-    # Get post with user info
-    cursor.execute("""
-        SELECT p.id, p.title, p.description, p.price, p.media_urls, p.tags,
-               p.created_at, p.view_count, p.file_url, p.user_id,
-               u.username, u.avatar_url,
-               COALESCE(SUM(v.value), 0) as vote_count
-        FROM posts p
-        JOIN users u ON p.user_id = u.id
-        LEFT JOIN votes v ON p.id = v.post_id
-        WHERE p.id = %s
-        GROUP BY p.id, u.id
-    """, (post_id,))
-    
-    row = cursor.fetchone()
-    if not row:
-        return jsonify({"error": "Post not found"}), 404
-
-    # Increment view count
-    cursor.execute("UPDATE posts SET view_count = view_count + 1 WHERE id = %s", (post_id,))
-    g.db.commit()
-
-    # Get comments with replies
-    cursor.execute("""
-        SELECT c.id, c.text, c.created_at, c.parent_id,
-               u.id, u.username
-        FROM comments c
-        JOIN users u ON c.user_id = u.id
-        WHERE c.post_id = %s
-        ORDER BY c.created_at ASC
-    """, (post_id,))
-    
-    comments_rows = cursor.fetchall()
-    comments = []
-    replies_map = {}
-    
-    for cr in comments_rows:
-        comment_obj = {
-            "id": cr[0],
-            "text": cr[1],
-            "created_at": cr[2].isoformat() if cr[2] else None,
-            "parent_id": cr[3],
-            "user": {"id": cr[4], "username": cr[5]}
-        }
-        if cr[3]:  # It's a reply
-            if cr[3] not in replies_map:
-                replies_map[cr[3]] = []
-            replies_map[cr[3]].append(comment_obj)
-        else:
-            comments.append(comment_obj)
-    
-    # Attach replies to parent comments
-    for comment in comments:
-        comment["replies"] = replies_map.get(comment["id"], [])
-
-    return jsonify({
-        "id": row[0],
-        "title": row[1],
-        "description": row[2],
-        "price": float(row[3]),
-        "media_urls": row[4] or [],
-        "tags": row[5] or [],
-        "created_at": row[6].isoformat() if row[6] else None,
-        "view_count": row[7] + 1,  # +1 because we just incremented
-        "file_url": row[8],
-        "vote_count": int(row[12]),
-        "comments": comments,
-        "user": {
-            "id": row[9],
-            "username": row[10],
-            "avatar_url": row[11]
-        }
-    })
+def notify(user_id, type_, message, related_id=None):
+    try:
+        query(
+            "INSERT INTO notifications (user_id, type, message, related_id) VALUES (%s,%s,%s,%s)",
+            [str(user_id), type_, message, str(related_id) if related_id else None],
+            fetch="none",
+        )
+    except Exception as e:
+        print("Notify error:", e)
 
 
-@app.route("/posts", methods=["POST"])
-@require_auth
-@limiter.limit("20 per minute")
-def create_post():
-    cursor = get_db()
-    
+# ──────────────────────────────────────────────
+# SERVE INDEX
+# ──────────────────────────────────────────────
+@app.route("/")
+def index():
+    return send_from_directory(".", "index.html")
+
+
+# ──────────────────────────────────────────────
+# AUTH ROUTES
+# ──────────────────────────────────────────────
+@app.route("/api/auth/signup", methods=["POST"])
+def signup():
+    d = request.get_json() or {}
+    first_name = d.get("first_name", "").strip()
+    last_name = d.get("last_name", "").strip()
+    username = d.get("username", "").strip().lower()
+    email = d.get("email", "").strip().lower()
+    password = d.get("password", "")
+
+    if not all([first_name, last_name, username, email, password]):
+        return jsonify({"error": "All fields are required"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if not re.match(r"^[a-z0-9_]{3,20}$", username):
+        return jsonify({"error": "Username: 3-20 chars, letters/numbers/underscores only"}), 400
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        return jsonify({"error": "Invalid email address"}), 400
+
+    existing = query("SELECT id FROM users WHERE email=%s OR username=%s", [email, username], fetch="one")
+    if existing:
+        return jsonify({"error": "Email or username already taken"}), 409
+
+    pw_hash = hash_password(password)
+    user = query(
+        """INSERT INTO users (first_name, last_name, username, email, password_hash)
+           VALUES (%s,%s,%s,%s,%s) RETURNING *""",
+        [first_name, last_name, username, email, pw_hash],
+        fetch="one",
+    )
+    session.permanent = True
+    session["user_id"] = str(user["id"])
+    return jsonify({"user": safe_user(user)}), 201
+
+
+@app.route("/api/auth/signin", methods=["POST"])
+def signin():
+    d = request.get_json() or {}
+    email = d.get("email", "").strip().lower()
+    password = d.get("password", "")
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    user = query("SELECT * FROM users WHERE email=%s AND is_active=TRUE", [email], fetch="one")
+    if not user or not verify_password(password, user["password_hash"]):
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    session.permanent = True
+    session["user_id"] = str(user["id"])
+    return jsonify({"user": safe_user(user)})
+
+
+@app.route("/api/auth/me")
+def me():
+    if "user_id" not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+    user = query("SELECT * FROM users WHERE id=%s", [session["user_id"]], fetch="one")
+    if not user:
+        session.clear()
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({"user": safe_user(user)})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"message": "Logged out"})
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+@login_required
+def change_password():
+    d = request.get_json() or {}
+    current = d.get("current_password", "")
+    new_pw = d.get("new_password", "")
+    if not current or not new_pw:
+        return jsonify({"error": "Both passwords required"}), 400
+    if len(new_pw) < 8:
+        return jsonify({"error": "New password must be at least 8 characters"}), 400
+    user = query("SELECT * FROM users WHERE id=%s", [session["user_id"]], fetch="one")
+    if not verify_password(current, user["password_hash"]):
+        return jsonify({"error": "Current password is incorrect"}), 401
+    query(
+        "UPDATE users SET password_hash=%s, updated_at=NOW() WHERE id=%s",
+        [hash_password(new_pw), session["user_id"]],
+        fetch="none",
+    )
+    return jsonify({"message": "Password updated"})
+
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+def forgot_password():
+    d = request.get_json() or {}
+    email = d.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+    user = query("SELECT id FROM users WHERE email=%s", [email], fetch="one")
+    if user:
+        token = secrets.token_urlsafe(32)
+        expires = datetime.utcnow() + timedelta(hours=1)
+        query(
+            "UPDATE users SET reset_token=%s, reset_token_expires=%s WHERE id=%s",
+            [token, expires, str(user["id"])],
+            fetch="none",
+        )
+        # TODO: Send email with reset link
+        print(f"Password reset token for {email}: {token}")
+    return jsonify({"message": "If that email exists, a reset link has been sent."})
+
+
+# ──────────────────────────────────────────────
+# LISTINGS
+# ──────────────────────────────────────────────
+@app.route("/api/listings", methods=["GET"])
+def get_listings():
+    sort = request.args.get("sort", "newest")
+    category = request.args.get("category", "")
+    q = request.args.get("q", "").strip()
+    min_price = request.args.get("min_price")
+    max_price = request.args.get("max_price")
+    page = max(1, int(request.args.get("page", 1)))
+    limit = min(50, int(request.args.get("limit", 9)))
+    offset = (page - 1) * limit
+
+    sorts = {
+        "newest": "l.created_at DESC",
+        "popular": "l.total_sales DESC",
+        "rating": "l.avg_rating DESC",
+        "price-asc": "l.price ASC",
+        "price-desc": "l.price DESC",
+    }
+    order_by = sorts.get(sort, "l.created_at DESC")
+
+    conditions = ["l.status='active'"]
+    params = []
+
+    if category:
+        conditions.append("l.category=%s")
+        params.append(category)
+    if q:
+        conditions.append("(l.title ILIKE %s OR l.short_description ILIKE %s OR l.description ILIKE %s)")
+        like = f"%{q}%"
+        params.extend([like, like, like])
+    if min_price is not None:
+        conditions.append("l.price>=%s")
+        params.append(float(min_price))
+    if max_price is not None:
+        conditions.append("l.price<=%s")
+        params.append(float(max_price))
+
+    where = " AND ".join(conditions)
+
+    count_row = query(
+        f"""SELECT COUNT(*) as cnt FROM listings l WHERE {where}""",
+        params, fetch="one"
+    )
+    total = count_row["cnt"] if count_row else 0
+
+    rows = query(
+        f"""SELECT l.*,
+               u.first_name || ' ' || u.last_name AS seller_name,
+               u.avatar_url AS seller_avatar,
+               u.avg_rating AS seller_rating,
+               u.total_sales AS seller_sales
+            FROM listings l
+            JOIN users u ON u.id=l.seller_id
+            WHERE {where}
+            ORDER BY {order_by}
+            LIMIT %s OFFSET %s""",
+        params + [limit, offset],
+    )
+    buyer_id = session.get("user_id")
+    listings = [format_listing(r, buyer_id) for r in rows]
+    return jsonify({"listings": listings, "total": total, "page": page, "per_page": limit})
+
+
+@app.route("/api/listings", methods=["POST"])
+@login_required
+def create_listing():
+    seller_id = session["user_id"]
     title = request.form.get("title", "").strip()
+    short_desc = request.form.get("short_description", "").strip()
     description = request.form.get("description", "").strip()
-    price = request.form.get("price", "0")
-    tags_str = request.form.get("tags", "")
-    
-    if not title:
-        return jsonify({"error": "Title is required"}), 400
+    category = request.form.get("category", "").strip()
+    price = float(request.form.get("price", 0) or 0)
+    license_ = request.form.get("license", "personal")
+    demo_url = request.form.get("demo_url", "").strip()
+    tags = json.loads(request.form.get("tags", "[]"))
+    features = json.loads(request.form.get("features", "[]"))
+
+    if not title or not description or not category:
+        return jsonify({"error": "Title, description, and category are required"}), 400
+
+    # Upload images
+    image_urls = []
+    files = request.files.getlist("images")
+    for f in files[:6]:
+        if f and f.filename:
+            result = cloudinary.uploader.upload(
+                f, folder="devmarket/listings", resource_type="image"
+            )
+            image_urls.append(result["secure_url"])
+
+    # Upload product file
+    file_url = None
+    file_key = None
+    pf = request.files.get("product_file")
+    if pf and pf.filename:
+        result = cloudinary.uploader.upload(
+            pf, folder="devmarket/files", resource_type="raw"
+        )
+        file_url = result["secure_url"]
+        file_key = result["public_id"]
+
+    listing = query(
+        """INSERT INTO listings
+           (seller_id, title, short_description, description, category, price,
+            license, demo_url, tags, features, images, file_url, file_key)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+        [
+            seller_id, title, short_desc, description, category, price,
+            license_, demo_url,
+            json.dumps(tags), json.dumps(features), json.dumps(image_urls),
+            file_url, file_key,
+        ],
+        fetch="one",
+    )
+    return jsonify({"listing": format_listing(listing)}), 201
+
+
+@app.route("/api/listings/mine")
+@login_required
+def my_listings():
+    rows = query(
+        """SELECT l.*,
+               u.first_name || ' ' || u.last_name AS seller_name,
+               u.avatar_url AS seller_avatar,
+               u.avg_rating AS seller_rating,
+               u.total_sales AS seller_sales
+            FROM listings l JOIN users u ON u.id=l.seller_id
+            WHERE l.seller_id=%s ORDER BY l.created_at DESC""",
+        [session["user_id"]],
+    )
+    return jsonify({"listings": [format_listing(r) for r in rows]})
+
+
+@app.route("/api/listings/<listing_id>", methods=["GET"])
+def get_listing(listing_id):
+    row = query(
+        """SELECT l.*,
+               u.first_name || ' ' || u.last_name AS seller_name,
+               u.avatar_url AS seller_avatar,
+               u.avg_rating AS seller_rating,
+               u.total_sales AS seller_sales
+            FROM listings l JOIN users u ON u.id=l.seller_id
+            WHERE l.id=%s""",
+        [listing_id], fetch="one"
+    )
+    if not row:
+        return jsonify({"error": "Listing not found"}), 404
+    listing = format_listing(row, session.get("user_id"))
+
+    # Reviews
+    reviews = query(
+        """SELECT r.*, u.first_name || ' ' || u.last_name AS reviewer_name, u.avatar_url AS reviewer_avatar
+           FROM reviews r JOIN users u ON u.id=r.reviewer_id
+           WHERE r.listing_id=%s ORDER BY r.created_at DESC""",
+        [listing_id]
+    )
+    listing["reviews"] = [
+        {**dict(rv), "id": str(rv["id"]), "listing_id": str(rv["listing_id"]),
+         "reviewer_id": str(rv["reviewer_id"]),
+         "created_at": rv["created_at"].isoformat() if rv["created_at"] else None}
+        for rv in reviews
+    ]
+    return jsonify({"listing": listing})
+
+
+@app.route("/api/listings/<listing_id>", methods=["DELETE"])
+@login_required
+def delete_listing(listing_id):
+    row = query("SELECT seller_id FROM listings WHERE id=%s", [listing_id], fetch="one")
+    if not row:
+        return jsonify({"error": "Not found"}), 404
+    if str(row["seller_id"]) != session["user_id"]:
+        return jsonify({"error": "Not authorized"}), 403
+    query("DELETE FROM listings WHERE id=%s", [listing_id], fetch="none")
+    return jsonify({"message": "Deleted"})
+
+
+@app.route("/api/listings/<listing_id>/download")
+@login_required
+def download_listing(listing_id):
+    buyer_id = session["user_id"]
+    order = query(
+        "SELECT id FROM orders WHERE listing_id=%s AND buyer_id=%s",
+        [listing_id, buyer_id], fetch="one"
+    )
+    listing = query("SELECT file_url, seller_id FROM listings WHERE id=%s", [listing_id], fetch="one")
+    if not listing:
+        return jsonify({"error": "Listing not found"}), 404
+    if not order and str(listing["seller_id"]) != buyer_id:
+        return jsonify({"error": "Purchase required to download"}), 403
+    if not listing["file_url"]:
+        return jsonify({"error": "No file available for this listing"}), 404
+    # Increment download count
+    query("UPDATE orders SET download_count=download_count+1 WHERE listing_id=%s AND buyer_id=%s",
+          [listing_id, buyer_id], fetch="none")
+    return jsonify({"download_url": listing["file_url"]})
+
+
+# ──────────────────────────────────────────────
+# PAYMENTS
+# ──────────────────────────────────────────────
+@app.route("/api/payments/checkout", methods=["POST"])
+@login_required
+def checkout():
+    d = request.get_json() or {}
+    listing_id = d.get("listing_id")
+    buyer_id = session["user_id"]
+
+    listing = query("SELECT * FROM listings WHERE id=%s AND status='active'", [listing_id], fetch="one")
+    if not listing:
+        return jsonify({"error": "Listing not found"}), 404
+    if str(listing["seller_id"]) == buyer_id:
+        return jsonify({"error": "You cannot purchase your own listing"}), 400
+
+    # Check already purchased
+    existing = query(
+        "SELECT id FROM orders WHERE listing_id=%s AND buyer_id=%s", [listing_id, buyer_id], fetch="one"
+    )
+    if existing:
+        return jsonify({"error": "You already own this product"}), 400
+
+    price = float(listing["price"])
+    if price <= 0:
+        return jsonify({"error": "Use the free claim endpoint for free products"}), 400
+
+    # ── Stripe Integration Point ──
+    # In production, create a PaymentIntent here:
+    # import stripe
+    # stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+    # pi = stripe.PaymentIntent.create(amount=int(price*100), currency='usd', ...)
+    # Then confirm with card details via stripe.js on frontend
+    # For now we simulate a successful charge:
+    stripe_payment_id = "pi_simulated_" + secrets.token_hex(8)
+
+    order = query(
+        """INSERT INTO orders (listing_id, buyer_id, seller_id, amount, stripe_payment_id)
+           VALUES (%s,%s,%s,%s,%s) RETURNING *""",
+        [listing_id, buyer_id, str(listing["seller_id"]), price, stripe_payment_id],
+        fetch="one"
+    )
+
+    # Update listing stats
+    query(
+        "UPDATE listings SET total_sales=total_sales+1 WHERE id=%s",
+        [listing_id], fetch="none"
+    )
+    # Update seller stats
+    query(
+        "UPDATE users SET total_sales=total_sales+1 WHERE id=%s",
+        [str(listing["seller_id"])], fetch="none"
+    )
+
+    # Notify seller
+    buyer = query("SELECT first_name, last_name FROM users WHERE id=%s", [buyer_id], fetch="one")
+    buyer_name = f"{buyer['first_name']} {buyer['last_name']}" if buyer else "A buyer"
+    notify(
+        listing["seller_id"], "sale",
+        f"{buyer_name} purchased '{listing['title']}' for ${price:.2f}",
+        listing_id
+    )
+    # Notify buyer
+    notify(
+        buyer_id, "purchase",
+        f"You successfully purchased '{listing['title']}'. Go to dashboard to download.",
+        listing_id
+    )
+
+    return jsonify({"order_id": str(order["id"]), "message": "Purchase successful"})
+
+
+@app.route("/api/payments/free", methods=["POST"])
+@login_required
+def claim_free():
+    d = request.get_json() or {}
+    listing_id = d.get("listing_id")
+    buyer_id = session["user_id"]
+
+    listing = query("SELECT * FROM listings WHERE id=%s AND status='active'", [listing_id], fetch="one")
+    if not listing:
+        return jsonify({"error": "Listing not found"}), 404
+    if float(listing["price"]) > 0:
+        return jsonify({"error": "This product is not free"}), 400
+    if str(listing["seller_id"]) == buyer_id:
+        return jsonify({"error": "You cannot claim your own listing"}), 400
+
+    existing = query(
+        "SELECT id FROM orders WHERE listing_id=%s AND buyer_id=%s", [listing_id, buyer_id], fetch="one"
+    )
+    if existing:
+        return jsonify({"error": "Already in your library"}), 400
+
+    query(
+        "INSERT INTO orders (listing_id, buyer_id, seller_id, amount) VALUES (%s,%s,%s,0)",
+        [listing_id, buyer_id, str(listing["seller_id"])], fetch="none"
+    )
+    query("UPDATE listings SET total_sales=total_sales+1 WHERE id=%s", [listing_id], fetch="none")
+    return jsonify({"message": "Added to your library"})
+
+
+# ──────────────────────────────────────────────
+# ORDERS
+# ──────────────────────────────────────────────
+@app.route("/api/orders/mine")
+@login_required
+def my_purchases():
+    rows = query(
+        """SELECT o.*, l.title AS listing_title,
+               u.first_name || ' ' || u.last_name AS seller_name,
+               (SELECT 1 FROM reviews r WHERE r.listing_id=o.listing_id AND r.reviewer_id=o.buyer_id) IS NOT NULL AS reviewed
+            FROM orders o
+            JOIN listings l ON l.id=o.listing_id
+            JOIN users u ON u.id=o.seller_id
+            WHERE o.buyer_id=%s ORDER BY o.created_at DESC""",
+        [session["user_id"]]
+    )
+    orders = []
+    for r in rows:
+        d = dict(r)
+        for k in ["id", "listing_id", "buyer_id", "seller_id"]:
+            if d.get(k):
+                d[k] = str(d[k])
+        d["amount"] = float(d["amount"])
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+        orders.append(d)
+    return jsonify({"orders": orders})
+
+
+@app.route("/api/orders/received")
+@login_required
+def received_orders():
+    rows = query(
+        """SELECT o.*, l.title AS listing_title,
+               u.first_name || ' ' || u.last_name AS buyer_name
+            FROM orders o
+            JOIN listings l ON l.id=o.listing_id
+            JOIN users u ON u.id=o.buyer_id
+            WHERE o.seller_id=%s ORDER BY o.created_at DESC""",
+        [session["user_id"]]
+    )
+    orders = []
+    for r in rows:
+        d = dict(r)
+        for k in ["id", "listing_id", "buyer_id", "seller_id"]:
+            if d.get(k):
+                d[k] = str(d[k])
+        d["amount"] = float(d["amount"])
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+        orders.append(d)
+    return jsonify({"orders": orders})
+
+
+# ──────────────────────────────────────────────
+# REVIEWS
+# ──────────────────────────────────────────────
+@app.route("/api/reviews", methods=["POST"])
+@login_required
+def post_review():
+    d = request.get_json() or {}
+    listing_id = d.get("listing_id")
+    rating = int(d.get("rating", 0))
+    title = d.get("title", "").strip()
+    body = d.get("body", "").strip()
+
+    if not listing_id or not rating or not body:
+        return jsonify({"error": "listing_id, rating, and body are required"}), 400
+    if not 1 <= rating <= 5:
+        return jsonify({"error": "Rating must be 1–5"}), 400
+
+    # Verify purchase
+    order = query(
+        "SELECT id FROM orders WHERE listing_id=%s AND buyer_id=%s",
+        [listing_id, session["user_id"]], fetch="one"
+    )
+    if not order:
+        return jsonify({"error": "Purchase required to review"}), 403
 
     try:
-        price = float(price)
-        if price < 0:
-            price = 0
-    except:
-        price = 0
-
-    tags = [t.strip().lower() for t in tags_str.split(",") if t.strip()]
-
-    # Handle preview images (media)
-    media_urls = []
-    if "media" in request.files:
-        files = request.files.getlist("media")
-        for file in files:
-            if file and file.filename:
-                url = upload_media(file)
-                if url:
-                    media_urls.append(url)
-
-    # Handle product file (the actual deliverable)
-    file_url = None
-    if "file" in request.files:
-        product_file = request.files["file"]
-        if product_file and product_file.filename:
-            file_url = upload_media(product_file, resource_type="raw")
-
-    cursor.execute("""
-        INSERT INTO posts (user_id, title, description, price, media_urls, file_url, tags)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-    """, (g.user_id, title, description, price, media_urls, file_url, tags))
-    
-    post_id = cursor.fetchone()[0]
-    g.db.commit()
-
-    return jsonify({
-        "id": post_id,
-        "title": title,
-        "price": price,
-        "media_urls": media_urls,
-        "file_url": file_url
-    }), 201
-
-
-@app.route("/posts/<int:post_id>", methods=["DELETE"])
-@require_auth
-def delete_post(post_id):
-    cursor = get_db()
-    
-    # Verify ownership
-    cursor.execute("SELECT user_id FROM posts WHERE id = %s", (post_id,))
-    post = cursor.fetchone()
-    
-    if not post:
-        return jsonify({"error": "Post not found"}), 404
-    
-    if post[0] != g.user_id:
-        return jsonify({"error": "Not authorized to delete this post"}), 403
-    
-    cursor.execute("DELETE FROM posts WHERE id = %s", (post_id,))
-    g.db.commit()
-    
-    return jsonify({"message": "Post deleted"}), 200
-
-# ==================== VOTES ====================
-
-@app.route("/posts/<int:post_id>/vote", methods=["POST"])
-@require_auth
-def vote_post(post_id):
-    data = request.get_json()
-    value = data.get("value")
-    
-    if value not in [1, -1]:
-        return jsonify({"error": "Invalid vote value"}), 400
-
-    cursor = get_db()
-    
-    # Check if post exists
-    cursor.execute("SELECT id FROM posts WHERE id = %s", (post_id,))
-    if not cursor.fetchone():
-        return jsonify({"error": "Post not found"}), 404
-
-    # Upsert vote
-    cursor.execute("""
-        INSERT INTO votes (post_id, user_id, value) 
-        VALUES (%s, %s, %s)
-        ON CONFLICT (post_id, user_id) 
-        DO UPDATE SET value = EXCLUDED.value
-    """, (post_id, g.user_id, value))
-    
-    g.db.commit()
-    return jsonify({"message": "Vote recorded"}), 200
-
-# ==================== COMMENTS ====================
-
-@app.route("/posts/<int:post_id>/comment", methods=["POST"])
-@require_auth
-def add_comment(post_id):
-    data = request.get_json()
-    text = data.get("text", "").strip()
-    parent_id = data.get("parent_id")
-    
-    if not text:
-        return jsonify({"error": "Comment text is required"}), 400
-
-    cursor = get_db()
-    
-    # Verify post exists
-    cursor.execute("SELECT user_id FROM posts WHERE id = %s", (post_id,))
-    post = cursor.fetchone()
-    if not post:
-        return jsonify({"error": "Post not found"}), 404
-    
-    # If parent_id provided, verify it exists and belongs to this post
-    if parent_id:
-        cursor.execute("SELECT id FROM comments WHERE id = %s AND post_id = %s", (parent_id, post_id))
-        if not cursor.fetchone():
-            return jsonify({"error": "Invalid parent comment"}), 400
-
-    cursor.execute("""
-        INSERT INTO comments (post_id, user_id, parent_id, text)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id, created_at
-    """, (post_id, g.user_id, parent_id, text))
-    
-    result = cursor.fetchone()
-    g.db.commit()
-    
-    # Create notification for post owner (if not self)
-    if post[0] != g.user_id:
-        cursor.execute("""
-            INSERT INTO notifications (user_id, type, message, related_id)
-            VALUES (%s, %s, %s, %s)
-        """, (post[0], "comment", f"Someone commented on your post", post_id))
-        g.db.commit()
-
-    return jsonify({
-        "id": result[0],
-        "text": text,
-        "created_at": result[1].isoformat(),
-        "user_id": g.user_id
-    }), 201
-
-# ==================== MESSAGES ====================
-
-@app.route("/messages", methods=["GET"])
-@require_auth
-def get_conversations():
-    cursor = get_db()
-    
-    # Get last message from each conversation partner
-    cursor.execute("""
-        WITH last_messages AS (
-            SELECT DISTINCT ON (LEAST(sender_id, receiver_id), GREATEST(sender_id, receiver_id))
-                id, sender_id, receiver_id, text, created_at, is_read,
-                CASE WHEN sender_id = %s THEN receiver_id ELSE sender_id END as other_user_id
-            FROM messages
-            WHERE sender_id = %s OR receiver_id = %s
-            ORDER BY LEAST(sender_id, receiver_id), GREATEST(sender_id, receiver_id), created_at DESC
+        review = query(
+            """INSERT INTO reviews (listing_id, reviewer_id, order_id, rating, title, body)
+               VALUES (%s,%s,%s,%s,%s,%s) RETURNING *""",
+            [listing_id, session["user_id"], str(order["id"]), rating, title, body],
+            fetch="one"
         )
-        SELECT lm.*, u.username
-        FROM last_messages lm
-        JOIN users u ON u.id = lm.other_user_id
-        ORDER BY lm.created_at DESC
-    """, (g.user_id, g.user_id, g.user_id))
-    
-    rows = cursor.fetchall()
-    conversations = []
-    
-    for r in rows:
-        other_user_id = r[5]
-        
-        # Count unread messages from this user
-        cursor.execute("""
-            SELECT COUNT(*) FROM messages 
-            WHERE sender_id = %s AND receiver_id = %s AND is_read = FALSE
-        """, (other_user_id, g.user_id))
-        unread_count = cursor.fetchone()[0]
-        
-        conversations.append({
-            "user_id": other_user_id,
-            "username": r[6],
-            "last_message": r[3],
-            "last_time": r[4].isoformat() if r[4] else None,
-            "unread_count": unread_count
-        })
-    
-    return jsonify(conversations)
+    except Exception as e:
+        if "unique" in str(e).lower():
+            # Update existing
+            review = query(
+                "UPDATE reviews SET rating=%s, title=%s, body=%s WHERE listing_id=%s AND reviewer_id=%s RETURNING *",
+                [rating, title, body, listing_id, session["user_id"]], fetch="one"
+            )
+        else:
+            return jsonify({"error": str(e)}), 500
+
+    # Recalculate avg rating
+    agg = query(
+        "SELECT AVG(rating) as avg, COUNT(*) as cnt FROM reviews WHERE listing_id=%s",
+        [listing_id], fetch="one"
+    )
+    query(
+        "UPDATE listings SET avg_rating=%s, review_count=%s WHERE id=%s",
+        [float(agg["avg"] or 0), agg["cnt"], listing_id], fetch="none"
+    )
+
+    listing = query("SELECT seller_id, title FROM listings WHERE id=%s", [listing_id], fetch="one")
+    if listing:
+        reviewer = query("SELECT first_name, last_name FROM users WHERE id=%s", [session["user_id"]], fetch="one")
+        name = f"{reviewer['first_name']} {reviewer['last_name']}" if reviewer else "A user"
+        notify(listing["seller_id"], "review",
+               f"{name} left a {rating}★ review on '{listing['title']}'", listing_id)
+
+    return jsonify({"message": "Review submitted"}), 201
 
 
-@app.route("/messages/<int:user_id>", methods=["GET"])
-@require_auth
-def get_messages_with_user(user_id):
-    cursor = get_db()
-    
-    # Mark messages as read
-    cursor.execute("""
-        UPDATE messages SET is_read = TRUE 
-        WHERE sender_id = %s AND receiver_id = %s AND is_read = FALSE
-    """, (user_id, g.user_id))
-    g.db.commit()
-    
-    # Get messages
-    cursor.execute("""
-        SELECT id, sender_id, receiver_id, text, created_at
-        FROM messages
-        WHERE (sender_id = %s AND receiver_id = %s) OR (sender_id = %s AND receiver_id = %s)
-        ORDER BY created_at ASC
-    """, (g.user_id, user_id, user_id, g.user_id))
-    
-    rows = cursor.fetchall()
-    messages = []
-    
-    for r in rows:
-        messages.append({
-            "id": r[0],
-            "is_me": r[1] == g.user_id,
-            "text": r[3],
-            "created_at": r[4].isoformat()
-        })
-    
-    return jsonify(messages)
-
-
-@app.route("/messages", methods=["POST"])
-@require_auth
-def send_message():
-    data = request.get_json()
-    receiver_id = data.get("receiver_id")
-    text = data.get("text", "").strip()
-    
-    if not receiver_id or not text:
-        return jsonify({"error": "Missing receiver or text"}), 400
-    
-    if receiver_id == g.user_id:
+# ──────────────────────────────────────────────
+# MESSAGES
+# ──────────────────────────────────────────────
+@app.route("/api/messages/start", methods=["POST"])
+@login_required
+def start_conversation():
+    d = request.get_json() or {}
+    other_id = d.get("other_user_id")
+    if not other_id:
+        return jsonify({"error": "other_user_id required"}), 400
+    me = session["user_id"]
+    if me == other_id:
         return jsonify({"error": "Cannot message yourself"}), 400
 
-    cursor = get_db()
-    
-    # Verify receiver exists
-    cursor.execute("SELECT id FROM users WHERE id = %s", (receiver_id,))
-    if not cursor.fetchone():
-        return jsonify({"error": "User not found"}), 404
-    
-    cursor.execute("""
-        INSERT INTO messages (sender_id, receiver_id, text)
-        VALUES (%s, %s, %s)
-        RETURNING id, created_at
-    """, (g.user_id, receiver_id, text))
-    
-    result = cursor.fetchone()
-    g.db.commit()
-    
-    # Create notification
-    cursor.execute("""
-        INSERT INTO notifications (user_id, type, message, related_id)
-        VALUES (%s, %s, %s, %s)
-    """, (receiver_id, "message", "You have a new message", g.user_id))
-    g.db.commit()
-    
-    return jsonify({
-        "id": result[0],
-        "text": text,
-        "created_at": result[1].isoformat()
-    }), 201
-
-# ==================== STRIPE / PAYMENTS ====================
-
-@app.route("/stripe/onboard", methods=["POST"])
-@require_auth
-def stripe_onboard():
-    cursor = get_db()
-    
-    # Get or create Stripe account
-    cursor.execute("SELECT stripe_account_id FROM users WHERE id = %s", (g.user_id,))
-    result = cursor.fetchone()
-    stripe_account_id = result[0] if result else None
-    
-    if not stripe_account_id:
-        try:
-            account = stripe.Account.create(
-                type="express",
-                country="US",
-                email=get_current_user()["email"],
-                capabilities={
-                    "card_payments": {"requested": True},
-                    "transfers": {"requested": True}
-                }
-            )
-            stripe_account_id = account.id
-            cursor.execute("UPDATE users SET stripe_account_id = %s WHERE id = %s", 
-                         (stripe_account_id, g.user_id))
-            g.db.commit()
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    
-    try:
-        account_link = stripe.AccountLink.create(
-            account=stripe_account_id,
-            refresh_url=f"{FRONTEND_URL}/settings?stripe=refresh",
-            return_url=f"{FRONTEND_URL}/settings?stripe=success",
-            type="account_onboarding"
+    a, b = sorted([me, other_id])
+    convo = query(
+        "SELECT id FROM conversations WHERE user_a=%s AND user_b=%s", [a, b], fetch="one"
+    )
+    if not convo:
+        convo = query(
+            "INSERT INTO conversations (user_a, user_b) VALUES (%s,%s) RETURNING id",
+            [a, b], fetch="one"
         )
-        return jsonify({"url": account_link.url})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"conversation_id": str(convo["id"])})
 
 
-@app.route("/posts/<int:post_id>/checkout", methods=["POST"])
-@require_auth
-def create_checkout(post_id):
-    cursor = get_db()
-    
-    # Get post details
-    cursor.execute("""
-        SELECT p.id, p.title, p.price, p.user_id, u.stripe_account_id, p.file_url
-        FROM posts p
-        JOIN users u ON p.user_id = u.id
-        WHERE p.id = %s
-    """, (post_id,))
-    
-    post = cursor.fetchone()
-    if not post:
-        return jsonify({"error": "Post not found"}), 404
-    
-    price = float(post[2])
-    seller_id = post[3]
-    seller_stripe_id = post[4]
-    file_url = post[5]
-    
-    # Check if already purchased
-    cursor.execute("SELECT id FROM purchases WHERE buyer_id = %s AND post_id = %s", (g.user_id, post_id))
-    if cursor.fetchone():
-        return jsonify({"error": "Already purchased", "file_url": file_url}), 400
-    
-    # Can't buy own post
-    if seller_id == g.user_id:
-        return jsonify({"error": "Cannot purchase your own post"}), 400
-    
-    # Free post - just record purchase
-    if price == 0:
-        cursor.execute("""
-            INSERT INTO purchases (buyer_id, post_id, amount, stripe_payment_intent_id)
-            VALUES (%s, %s, 0, 'free')
-        """, (g.user_id, post_id))
-        g.db.commit()
-        return jsonify({"free": True, "file_url": file_url})
-    
-    # Check seller has Stripe
-    if not seller_stripe_id:
-        return jsonify({"error": "Seller not set up for payments"}), 400
-    
-    try:
-        # Calculate platform fee (10%)
-        platform_fee = int(price * 10)  # in cents for Stripe
-        
-        checkout_session = stripe.checkout.Session.create(
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {"name": post[1]},
-                    "unit_amount": int(price * 100),  # Convert to cents
-                },
-                "quantity": 1,
-            }],
-            mode="payment",
-            success_url=f"{FRONTEND_URL}?checkout=success&post_id={post_id}",
-            cancel_url=f"{FRONTEND_URL}?checkout=cancel",
-            payment_intent_data={
-                "application_fee_amount": platform_fee,
-                "transfer_data": {"destination": seller_stripe_id},
-            },
-            metadata={"post_id": post_id, "buyer_id": g.user_id}
-        )
-        
-        return jsonify({"checkout_url": checkout_session.url})
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/posts/<int:post_id>/download", methods=["GET"])
-@require_auth
-def download_file(post_id):
-    cursor = get_db()
-    
-    # Check ownership or purchase
-    cursor.execute("SELECT user_id, file_url FROM posts WHERE id = %s", (post_id,))
-    post = cursor.fetchone()
-    
-    if not post:
-        return jsonify({"error": "Post not found"}), 404
-    
-    is_owner = post[0] == g.user_id
-    
-    if not is_owner:
-        cursor.execute("SELECT id FROM purchases WHERE buyer_id = %s AND post_id = %s", (g.user_id, post_id))
-        if not cursor.fetchone():
-            return jsonify({"error": "Purchase required"}), 403
-    
-    if not post[1]:
-        return jsonify({"error": "No file available"}), 404
-    
-    return jsonify({"file_url": post[1]})
-
-
-@app.route("/purchases/me", methods=["GET"])
-@require_auth
-def get_my_purchases():
-    cursor = get_db()
-    cursor.execute("SELECT post_id FROM purchases WHERE buyer_id = %s", (g.user_id,))
-    rows = cursor.fetchall()
-    return jsonify([r[0] for r in rows])
-
-# ==================== WEBHOOK ====================
-
-@app.route("/webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.get_data()
-    sig_header = request.headers.get("Stripe-Signature")
-    
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except:
-        return jsonify({"error": "Invalid signature"}), 400
-    
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        post_id = int(session["metadata"]["post_id"])
-        buyer_id = int(session["metadata"]["buyer_id"])
-        amount = session["amount_total"] / 100  # Convert from cents
-        
-        cursor = get_db()
-        
-        # Record purchase
-        cursor.execute("""
-            INSERT INTO purchases (buyer_id, post_id, amount, stripe_payment_intent_id)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (buyer_id, post_id) DO NOTHING
-        """, (buyer_id, post_id, amount, session["payment_intent"]))
-        
-        # Update seller earnings and sales count
-        cursor.execute("""
-            UPDATE users SET total_earnings = total_earnings + %s 
-            WHERE id = (SELECT user_id FROM posts WHERE id = %s)
-        """, (amount * 0.9, post_id))  # 90% to seller
-        
-        cursor.execute("""
-            UPDATE posts SET sales_count = sales_count + 1 WHERE id = %s
-        """, (post_id,))
-        
-        # Create notification
-        cursor.execute("SELECT user_id FROM posts WHERE id = %s", (post_id,))
-        seller_id = cursor.fetchone()[0]
-        cursor.execute("""
-            INSERT INTO notifications (user_id, type, message, related_id)
-            VALUES (%s, %s, %s, %s)
-        """, (seller_id, "sale", f"You made a sale! ${amount:.2f}", post_id))
-        
-        g.db.commit()
-    
-    return jsonify({"status": "success"})
-
-# ==================== NOTIFICATIONS ====================
-
-@app.route("/notifications", methods=["GET"])
-@require_auth
-def get_notifications():
-    cursor = get_db()
-    cursor.execute("""
-        SELECT id, type, message, related_id, is_read, created_at
-        FROM notifications
-        WHERE user_id = %s
-        ORDER BY created_at DESC
-        LIMIT 50
-    """, (g.user_id,))
-    
-    rows = cursor.fetchall()
-    notifications = []
-    
+@app.route("/api/messages/conversations")
+@login_required
+def get_conversations():
+    me = session["user_id"]
+    rows = query(
+        """SELECT c.*,
+               CASE WHEN c.user_a=%s THEN c.user_b ELSE c.user_a END AS other_user_id,
+               CASE WHEN c.user_a=%s THEN ub.first_name || ' ' || ub.last_name
+                    ELSE ua.first_name || ' ' || ua.last_name END AS other_user_name,
+               CASE WHEN c.user_a=%s THEN ub.avatar_url ELSE ua.avatar_url END AS other_user_avatar,
+               (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.sender_id!=cast(%s as uuid) AND m.is_read=FALSE) AS unread_count
+            FROM conversations c
+            JOIN users ua ON ua.id=c.user_a
+            JOIN users ub ON ub.id=c.user_b
+            WHERE c.user_a=%s OR c.user_b=%s
+            ORDER BY c.last_message_at DESC NULLS LAST""",
+        [me, me, me, me, me, me]
+    )
+    convos = []
     for r in rows:
-        notifications.append({
-            "id": r[0],
-            "type": r[1],
-            "message": r[2],
-            "related_id": r[3],
-            "is_read": r[4],
-            "created_at": r[5].isoformat()
-        })
-    
-    return jsonify(notifications)
+        d = dict(r)
+        for k in ["id", "user_a", "user_b", "other_user_id"]:
+            if d.get(k):
+                d[k] = str(d[k])
+        if d.get("last_message_at"):
+            d["last_message_at"] = d["last_message_at"].isoformat()
+        convos.append(d)
+    return jsonify({"conversations": convos})
 
 
-@app.route("/notifications/read", methods=["POST"])
-@require_auth
-def mark_notifications_read():
-    cursor = get_db()
-    cursor.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = %s", (g.user_id,))
-    g.db.commit()
-    return jsonify({"message": "Marked as read"})
+@app.route("/api/messages/<convo_id>", methods=["GET"])
+@login_required
+def get_messages(convo_id):
+    me = session["user_id"]
+    convo = query(
+        "SELECT * FROM conversations WHERE id=%s AND (user_a=%s OR user_b=%s)",
+        [convo_id, me, me], fetch="one"
+    )
+    if not convo:
+        return jsonify({"error": "Conversation not found"}), 404
+    # Mark as read
+    query(
+        "UPDATE messages SET is_read=TRUE WHERE conversation_id=%s AND sender_id!=%s",
+        [convo_id, me], fetch="none"
+    )
+    rows = query(
+        """SELECT m.*, u.first_name || ' ' || u.last_name AS sender_name
+           FROM messages m JOIN users u ON u.id=m.sender_id
+           WHERE m.conversation_id=%s ORDER BY m.created_at ASC""",
+        [convo_id]
+    )
+    msgs = []
+    for r in rows:
+        d = dict(r)
+        for k in ["id", "conversation_id", "sender_id"]:
+            if d.get(k):
+                d[k] = str(d[k])
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+        msgs.append(d)
+    return jsonify({"messages": msgs})
 
-# ==================== USERS / PROFILES ====================
 
-@app.route("/users/<int:user_id>", methods=["GET"])
+@app.route("/api/messages/<convo_id>", methods=["POST"])
+@login_required
+def send_message(convo_id):
+    me = session["user_id"]
+    d = request.get_json() or {}
+    body = d.get("body", "").strip()
+    if not body:
+        return jsonify({"error": "Message body required"}), 400
+
+    convo = query(
+        "SELECT * FROM conversations WHERE id=%s AND (user_a=%s OR user_b=%s)",
+        [convo_id, me, me], fetch="one"
+    )
+    if not convo:
+        return jsonify({"error": "Conversation not found"}), 404
+
+    msg = query(
+        "INSERT INTO messages (conversation_id, sender_id, body) VALUES (%s,%s,%s) RETURNING *",
+        [convo_id, me, body], fetch="one"
+    )
+    query(
+        "UPDATE conversations SET last_message=%s, last_message_at=NOW() WHERE id=%s",
+        [body[:100], convo_id], fetch="none"
+    )
+
+    # Notify recipient
+    other_id = str(convo["user_b"]) if str(convo["user_a"]) == me else str(convo["user_a"])
+    sender = query("SELECT first_name FROM users WHERE id=%s", [me], fetch="one")
+    sender_name = sender["first_name"] if sender else "Someone"
+    notify(other_id, "msg", f"{sender_name} sent you a message: {body[:60]}", convo_id)
+
+    return jsonify({"message": "Sent"})
+
+
+# ──────────────────────────────────────────────
+# USERS / PROFILE
+# ──────────────────────────────────────────────
+@app.route("/api/users/<user_id>")
 def get_user_profile(user_id):
-    cursor = get_db()
-    
-    # Get user info
-    cursor.execute("""
-        SELECT id, username, bio, avatar_url, total_earnings, created_at
-        FROM users WHERE id = %s
-    """, (user_id,))
-    
-    user = cursor.fetchone()
+    user = query("SELECT * FROM users WHERE id=%s AND is_active=TRUE", [user_id], fetch="one")
     if not user:
         return jsonify({"error": "User not found"}), 404
-    
-    # Get user's posts
-    cursor.execute("""
-        SELECT p.id, p.title, p.description, p.price, p.media_urls, p.tags,
-               p.created_at, p.view_count, p.sales_count, p.file_url,
-               COALESCE(SUM(v.value), 0) as vote_count
-        FROM posts p
-        LEFT JOIN votes v ON p.id = v.post_id
-        WHERE p.user_id = %s
-        GROUP BY p.id
-        ORDER BY p.created_at DESC
-    """, (user_id,))
-    
-    posts_rows = cursor.fetchall()
-    posts = []
-    
-    for r in posts_rows:
-        posts.append({
-            "id": r[0],
-            "title": r[1],
-            "description": r[2],
-            "price": float(r[3]),
-            "media_urls": r[4] or [],
-            "tags": r[5] or [],
-            "created_at": r[6].isoformat() if r[6] else None,
-            "view_count": r[7] or 0,
-            "sales_count": r[8] or 0,
-            "file_url": r[9],
-            "vote_count": int(r[10]),
-            "user": {"id": user[0], "username": user[1]}  # Embed user for frontend compatibility
-        })
-    
+    listings = query(
+        """SELECT l.*,
+               u.first_name || ' ' || u.last_name AS seller_name,
+               u.avatar_url AS seller_avatar,
+               u.avg_rating AS seller_rating,
+               u.total_sales AS seller_sales
+            FROM listings l JOIN users u ON u.id=l.seller_id
+            WHERE l.seller_id=%s AND l.status='active' ORDER BY l.created_at DESC""",
+        [user_id]
+    )
     return jsonify({
-        "id": user[0],
-        "username": user[1],
-        "bio": user[2],
-        "avatar_url": user[3],
-        "total_earnings": float(user[4] or 0),
-        "created_at": user[5].isoformat() if user[5] else None,
-        "posts": posts
+        "user": safe_user(user),
+        "listings": [format_listing(r) for r in listings]
     })
 
 
-@app.route("/users/me", methods=["PUT"])
-@require_auth
+@app.route("/api/users/me", methods=["PUT"])
+@login_required
 def update_profile():
-    data = request.get_json()
-    username = data.get("username", "").strip()
-    bio = data.get("bio", "").strip()
-    
-    if not username:
-        return jsonify({"error": "Username is required"}), 400
-    
-    if len(username) < 3 or len(username) > 50:
-        return jsonify({"error": "Username must be 3-50 characters"}), 400
-    
-    cursor = get_db()
-    
-    # Check username availability (if changed)
-    cursor.execute("SELECT id FROM users WHERE username = %s AND id != %s", (username, g.user_id))
-    if cursor.fetchone():
-        return jsonify({"error": "Username already taken"}), 409
-    
-    try:
-        cursor.execute("""
-            UPDATE users SET username = %s, bio = %s WHERE id = %s
-        """, (username, bio, g.user_id))
-        g.db.commit()
-        return jsonify({"message": "Profile updated", "username": username, "bio": bio})
-    except Exception as e:
-        g.db.rollback()
-        return jsonify({"error": str(e)}), 500
+    d = request.get_json() or {}
+    allowed = ["first_name", "last_name", "username", "bio", "website", "github", "twitter", "location"]
+    updates = {k: v for k, v in d.items() if k in allowed}
+    if not updates:
+        return jsonify({"error": "Nothing to update"}), 400
 
-# ==================== MAIN ====================
+    if "username" in updates:
+        ex = query(
+            "SELECT id FROM users WHERE username=%s AND id!=%s",
+            [updates["username"], session["user_id"]], fetch="one"
+        )
+        if ex:
+            return jsonify({"error": "Username already taken"}), 409
 
+    set_clause = ", ".join(f"{k}=%s" for k in updates)
+    values = list(updates.values()) + [session["user_id"]]
+    user = query(
+        f"UPDATE users SET {set_clause}, updated_at=NOW() WHERE id=%s RETURNING *",
+        values, fetch="one"
+    )
+    return jsonify({"user": safe_user(user)})
+
+
+@app.route("/api/users/me", methods=["DELETE"])
+@login_required
+def delete_account():
+    query("UPDATE users SET is_active=FALSE WHERE id=%s", [session["user_id"]], fetch="none")
+    session.clear()
+    return jsonify({"message": "Account deleted"})
+
+
+# ──────────────────────────────────────────────
+# NOTIFICATIONS
+# ──────────────────────────────────────────────
+@app.route("/api/notifications")
+@login_required
+def get_notifications():
+    rows = query(
+        "SELECT * FROM notifications WHERE user_id=%s ORDER BY created_at DESC LIMIT 50",
+        [session["user_id"]]
+    )
+    notifs = []
+    for r in rows:
+        d = dict(r)
+        d["id"] = str(d["id"])
+        d["user_id"] = str(d["user_id"])
+        if d.get("related_id"):
+            d["related_id"] = str(d["related_id"])
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+        notifs.append(d)
+    return jsonify({"notifications": notifs})
+
+
+@app.route("/api/notifications/unread-count")
+@login_required
+def unread_count():
+    row = query(
+        "SELECT COUNT(*) as cnt FROM notifications WHERE user_id=%s AND is_read=FALSE",
+        [session["user_id"]], fetch="one"
+    )
+    return jsonify({"count": row["cnt"] if row else 0})
+
+
+@app.route("/api/notifications/<notif_id>/read", methods=["POST"])
+@login_required
+def mark_read(notif_id):
+    query(
+        "UPDATE notifications SET is_read=TRUE WHERE id=%s AND user_id=%s",
+        [notif_id, session["user_id"]], fetch="none"
+    )
+    return jsonify({"message": "Marked as read"})
+
+
+@app.route("/api/notifications/read-all", methods=["POST"])
+@login_required
+def mark_all_read():
+    query(
+        "UPDATE notifications SET is_read=TRUE WHERE user_id=%s",
+        [session["user_id"]], fetch="none"
+    )
+    return jsonify({"message": "All marked as read"})
+
+
+# ──────────────────────────────────────────────
+# DASHBOARD STATS
+# ──────────────────────────────────────────────
+@app.route("/api/dashboard/stats")
+@login_required
+def dashboard_stats():
+    me = session["user_id"]
+    revenue = query(
+        "SELECT COALESCE(SUM(amount),0) as total FROM orders WHERE seller_id=%s", [me], fetch="one"
+    )
+    sales = query(
+        "SELECT COUNT(*) as cnt FROM orders WHERE seller_id=%s", [me], fetch="one"
+    )
+    listings = query(
+        "SELECT COUNT(*) as cnt FROM listings WHERE seller_id=%s AND status='active'", [me], fetch="one"
+    )
+    rating = query(
+        "SELECT COALESCE(AVG(avg_rating),0) as avg FROM listings WHERE seller_id=%s AND review_count>0",
+        [me], fetch="one"
+    )
+    return jsonify({
+        "stats": {
+            "revenue": float(revenue["total"] or 0),
+            "sales": sales["cnt"] or 0,
+            "listings": listings["cnt"] or 0,
+            "avg_rating": float(rating["avg"] or 0),
+        }
+    })
+
+
+# ──────────────────────────────────────────────
+# HEALTH
+# ──────────────────────────────────────────────
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "ok", "service": "DevMarket API"})
+
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=port, debug=False)
+    init_db()
+    port = int(os.getenv("PORT", 5000))
+    debug = os.getenv("FLASK_ENV") != "production"
+    print(f"🚀 DevMarket running on http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=debug)
