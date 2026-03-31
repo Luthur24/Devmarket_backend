@@ -1,10 +1,7 @@
 flask
 flask-cors
 psycopg2-binary
-pyjwt
 bcrypt
+pyjwt
 cloudinary
-python-dotenv
-Flask-Limiter
-stripe
 gunicorn
