@@ -649,11 +649,13 @@ def get_cart():
     db  = get_db()
     cur = db.cursor()
     cur.execute("""
-        SELECT p.*, c.id AS cart_item_id
-        FROM devmarket_cart_items c
-        JOIN devmarket_products p ON c.product_id = p.id
-        WHERE c.user_id = %s
+    SELECT p.*, c.id AS cart_item_id, u.username AS seller_name
+    FROM devmarket_cart_items c
+    JOIN devmarket_products p ON c.product_id = p.id
+    JOIN devmarket_users u ON p.seller_id = u.id
+    WHERE c.user_id = %s
     """, (g.user_id,))
+
     items = [dict(r) for r in cur.fetchall()]
     cur.close()
     return jsonify({'cart': items})
@@ -691,6 +693,20 @@ def remove_from_cart(item_id):
     db.commit()
     cur.close()
     return jsonify({'message': 'Removed from cart'})
+    
+@app.route('/api/cart/all', methods=['DELETE'])
+@login_required
+def clear_cart():
+    db  = get_db()
+    cur = db.cursor()
+    cur.execute(
+        "DELETE FROM devmarket_cart_items WHERE user_id = %s",
+        (g.user_id,)
+    )
+    db.commit()
+    cur.close()
+    return jsonify({'message': 'Cart cleared'})
+
 
 # ── ORDERS / CHECKOUT ─────────────────────────────────────────────
 @app.route('/api/orders', methods=['POST'])
