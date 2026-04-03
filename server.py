@@ -1065,11 +1065,45 @@ def post_review(pid):
 def reply_to_review(pid, rid):
     data = request.get_json() or {}
     reply = (data.get('reply') or '').strip()
+    
     if not reply:
         return jsonify({'error': 'Reply required'}), 400
+    if len(reply) > 1000:
+        return jsonify({'error': 'Reply must be under 1000 characters'}), 400
     
     db = get_db()
     cur = db.cursor()
+    
+    # Verify product belongs to current user
+    cur.execute("SELECT seller_id FROM devmarket_products WHERE id = %s", (pid,))
+    p = cur.fetchone()
+    if not p or p['seller_id'] != g.user_id:
+        cur.close()
+        return jsonify({'error': 'Forbidden - not your product'}), 403
+    
+    # Verify review exists and belongs to this product
+    cur.execute("SELECT id FROM devmarket_reviews WHERE id = %s AND product_id = %s", (rid, pid))
+    if not cur.fetchone():
+        cur.close()
+        return jsonify({'error': 'Review not found'}), 404
+    
+    # Update reply
+    cur.execute("UPDATE devmarket_reviews SET seller_reply = %s WHERE id = %s AND product_id = %s",
+                (reply, rid, pid))
+    db.commit()
+    cur.close()
+    
+    # Recalculate rating (optional - reply doesn't affect rating but good to trigger update)
+    recalc_rating(pid)
+    
+    return jsonify({'message': 'Reply added'})
+
+@app.route('/api/products/<int:pid>/reviews/<int:rid>/reply', methods=['DELETE'])
+@login_required
+def delete_review_reply(pid, rid):
+    db = get_db()
+    cur = db.cursor()
+    
     # Verify product belongs to current user
     cur.execute("SELECT seller_id FROM devmarket_products WHERE id = %s", (pid,))
     p = cur.fetchone()
@@ -1077,11 +1111,17 @@ def reply_to_review(pid, rid):
         cur.close()
         return jsonify({'error': 'Forbidden'}), 403
     
-    cur.execute("UPDATE devmarket_reviews SET seller_reply = %s WHERE id = %s AND product_id = %s",
-                (reply, rid, pid))
+    # Clear the reply
+    cur.execute("UPDATE devmarket_reviews SET seller_reply = NULL WHERE id = %s AND product_id = %s",
+                (rid, pid))
+    if cur.rowcount == 0:
+        cur.close()
+        return jsonify({'error': 'Review not found'}), 404
+        
     db.commit()
     cur.close()
-    return jsonify({'message': 'Reply added'})
+    return jsonify({'message': 'Reply deleted'})
+
 
 
 # ── WALLET ────────────────────────────────────────────────────────
