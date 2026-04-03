@@ -166,6 +166,7 @@ def init_db():
     """)
 
     # ── Reviews ──────────────────────────────────────────────────
+        # ── Reviews ──────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS devmarket_reviews (
             id          SERIAL PRIMARY KEY,
@@ -173,10 +174,12 @@ def init_db():
             reviewer_id INTEGER REFERENCES devmarket_users(id) ON DELETE CASCADE,
             rating      SMALLINT CHECK (rating BETWEEN 1 AND 5),
             comment     TEXT,
+            seller_reply TEXT,  -- ADD THIS LINE
             created_at  TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (product_id, reviewer_id)
         )
     """)
+
 
     # ── Wallet Transactions ───────────────────────────────────────
     cur.execute("""
@@ -1055,6 +1058,30 @@ def post_review(pid):
         return jsonify({'error': 'Already reviewed'}), 409
     finally:
         cur.close()
+        
+@app.route('/api/products/<int:pid>/reviews/<int:rid>/reply', methods=['PUT'])
+@login_required
+def reply_to_review(pid, rid):
+    data = request.get_json() or {}
+    reply = (data.get('reply') or '').strip()
+    if not reply:
+        return jsonify({'error': 'Reply required'}), 400
+    
+    db = get_db()
+    cur = db.cursor()
+    # Verify product belongs to current user
+    cur.execute("SELECT seller_id FROM devmarket_products WHERE id = %s", (pid,))
+    p = cur.fetchone()
+    if not p or p['seller_id'] != g.user_id:
+        cur.close()
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    cur.execute("UPDATE devmarket_reviews SET seller_reply = %s WHERE id = %s AND product_id = %s",
+                (reply, rid, pid))
+    db.commit()
+    cur.close()
+    return jsonify({'message': 'Reply added'})
+
 
 # ── WALLET ────────────────────────────────────────────────────────
 @app.route('/api/wallet', methods=['GET'])
