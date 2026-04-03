@@ -638,9 +638,10 @@ def my_products():
     db  = get_db()
     cur = db.cursor()
     cur.execute(
-        "SELECT * FROM devmarket_products WHERE seller_id = %s ORDER BY created_at DESC",
-        (g.user_id,)
-    )
+    "SELECT * FROM devmarket_products WHERE seller_id = %s AND status != 'removed' ORDER BY created_at DESC",
+    (g.user_id,)
+)
+
     products = [dict(r) for r in cur.fetchall()]
     cur.close()
     return jsonify({'products': products})
