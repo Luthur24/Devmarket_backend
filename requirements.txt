@@ -1,7 +1,4 @@
 flask
 flask-cors
-psycopg2-binary
-bcrypt
-pyjwt
-cloudinary
+requests
 gunicorn
