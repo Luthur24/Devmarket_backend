@@ -1,6 +1,3 @@
 flask
 flask-cors
-flask-sqlalchemy
 requests
-gunicorn
-extensions
