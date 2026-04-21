@@ -1,40 +1,25 @@
 import os
 import json
 import requests
-from datetime import datetime
-from flask import Blueprint, request, jsonify
-from flask_cors import cross_origin
-from extensions import db
+from datetime import datetime, timezone
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 
-rivalscan = Blueprint("rivalscan", __name__, url_prefix="/rivalscan")
+app = Flask(__name__)
+CORS(app)
 
-MISTRAL_API_KEY='yjvknUyDmAP6SKLQAUtqM5FH65cP69Id'
+# ─── in-memory stats (resets on restart, but zero setup) ─────────
+_stats = {"visits": 0, "searches": 0}
+
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "yjvknUyDmAP6SKLQAUtqM5FH65cP69Id")
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
-# ─── db model ────────────────────────────────────────────────────────────────
-
-class RivalscanStat(db.Model):
-    __tablename__ = "rivalscan_stats"
-    id       = db.Column(db.Integer, primary_key=True)
-    visits   = db.Column(db.Integer, default=0, nullable=False)
-    searches = db.Column(db.Integer, default=0, nullable=False)
-
-    @classmethod
-    def get(cls):
-        row = cls.query.first()
-        if not row:
-            row = cls(visits=0, searches=0)
-            db.session.add(row)
-            db.session.commit()
-        return row
-
-
-# ─── helpers ─────────────────────────────────────────────────────────────────
+# ─── helpers ─────────────────────────────────────────────────────
 
 def call_mistral(prompt: str) -> str:
     if not MISTRAL_API_KEY:
-        raise ValueError("MISTRAL_API_KEY not set in environment")
+        raise ValueError("MISTRAL_API_KEY not set")
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json",
@@ -98,28 +83,22 @@ def strip_fences(raw: str) -> str:
     return clean.strip()
 
 
-# ─── routes ──────────────────────────────────────────────────────────────────
+# ─── API routes (frontend expects these exact paths) ─────────────
 
-@rivalscan.route("/track-visit", methods=["POST", "OPTIONS"])
-@cross_origin()
+@app.route("/rivalscan/track-visit", methods=["POST", "OPTIONS"])
 def track_visit():
-    stat = RivalscanStat.get()
-    stat.visits += 1
-    db.session.commit()
-    return jsonify({"ok": True, "visits": stat.visits})
+    _stats["visits"] += 1
+    return jsonify({"ok": True, "visits": _stats["visits"]})
 
 
-@rivalscan.route("/stats", methods=["GET", "OPTIONS"])
-@cross_origin()
+@app.route("/rivalscan/stats", methods=["GET", "OPTIONS"])
 def get_stats():
-    stat = RivalscanStat.get()
-    return jsonify({"visits": stat.visits, "searches": stat.searches})
+    return jsonify({"visits": _stats["visits"], "searches": _stats["searches"]})
 
 
-@rivalscan.route("/search", methods=["POST", "OPTIONS"])
-@cross_origin()
+@app.route("/rivalscan/search", methods=["POST", "OPTIONS"])
 def search():
-    data  = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True) or {}
     query = (data.get("query") or "").strip()
 
     if not query:
@@ -127,9 +106,7 @@ def search():
     if len(query) > 250:
         return jsonify({"error": "Query too long (max 250 characters)"}), 400
 
-    stat = RivalscanStat.get()
-    stat.searches += 1
-    db.session.commit()
+    _stats["searches"] += 1
 
     try:
         raw = call_mistral(build_prompt(query))
@@ -151,8 +128,24 @@ def search():
         return jsonify({"error": "Unexpected AI response format"}), 500
 
     return jsonify({
-        "query":       query,
+        "query": query,
         "competitors": competitors,
-        "total":       len(competitors),
-        "timestamp":   datetime.utcnow().isoformat() + "Z",
+        "total": len(competitors),
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
+
+
+# ─── optional: serve your frontend HTML from the same app ────────
+# If you put Competitorsearch.html in the same folder as this file,
+# visiting the root URL will show the page. Otherwise, comment this out.
+@app.route("/")
+def serve_frontend():
+    try:
+        return send_from_directory(".", "Competitorsearch.html")
+    except Exception:
+        return jsonify({"status": "RivalScan backend is running"})
+
+
+# ─── start ───────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
