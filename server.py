@@ -1,5 +1,7 @@
 import os
 import json
+import uuid
+import threading
 import requests
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_from_directory
@@ -8,18 +10,19 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# ─── in-memory stats (resets on restart, but zero setup) ─────────
+# ─── in-memory stores ────────────────────────────────────────────────────────
 _stats = {"visits": 0, "searches": 0}
 
+# job store: { job_id: { "status": "pending|done|error", "result": {...} } }
+_jobs = {}
+
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "yjvknUyDmAP6SKLQAUtqM5FH65cP69Id")
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 
 
-# ─── helpers ─────────────────────────────────────────────────────
+# ─── helpers ─────────────────────────────────────────────────────────────────
 
 def call_mistral(prompt: str) -> str:
-    if not MISTRAL_API_KEY:
-        raise ValueError("MISTRAL_API_KEY not set")
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json",
@@ -28,9 +31,9 @@ def call_mistral(prompt: str) -> str:
         "model": "mistral-small-latest",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.35,
-        "max_tokens": 3000,
+        "max_tokens": 2500,
     }
-    res = requests.post(MISTRAL_URL, headers=headers, json=payload, timeout=45)
+    res = requests.post(MISTRAL_URL, headers=headers, json=payload, timeout=170)
     res.raise_for_status()
     return res.json()["choices"][0]["message"]["content"]
 
@@ -83,7 +86,36 @@ def strip_fences(raw: str) -> str:
     return clean.strip()
 
 
-# ─── API routes (frontend expects these exact paths) ─────────────
+def process_job(job_id: str, query: str):
+    """Runs in a background thread. Updates _jobs[job_id] when done."""
+    try:
+        raw         = call_mistral(build_prompt(query))
+        competitors = json.loads(strip_fences(raw))
+
+        if not isinstance(competitors, list):
+            raise ValueError("AI returned non-list response")
+
+        _jobs[job_id] = {
+            "status": "done",
+            "result": {
+                "query":       query,
+                "competitors": competitors,
+                "total":       len(competitors),
+                "timestamp":   datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+        }
+
+    except requests.exceptions.Timeout:
+        _jobs[job_id] = {"status": "error", "error": "AI service timed out. Please try again."}
+    except requests.exceptions.HTTPError as e:
+        _jobs[job_id] = {"status": "error", "error": f"AI service error: {e.response.status_code}"}
+    except json.JSONDecodeError:
+        _jobs[job_id] = {"status": "error", "error": "Could not parse AI response. Try again."}
+    except Exception as e:
+        _jobs[job_id] = {"status": "error", "error": str(e)}
+
+
+# ─── routes ──────────────────────────────────────────────────────────────────
 
 @app.route("/rivalscan/track-visit", methods=["POST", "OPTIONS"])
 def track_visit():
@@ -96,9 +128,10 @@ def get_stats():
     return jsonify({"visits": _stats["visits"], "searches": _stats["searches"]})
 
 
-@app.route("/rivalscan/search", methods=["POST", "OPTIONS"])
-def search():
-    data = request.get_json(silent=True) or {}
+@app.route("/rivalscan/start", methods=["POST", "OPTIONS"])
+def start_search():
+    """Instantly returns a job_id and kicks off Mistral in a background thread."""
+    data  = request.get_json(silent=True) or {}
     query = (data.get("query") or "").strip()
 
     if not query:
@@ -108,44 +141,45 @@ def search():
 
     _stats["searches"] += 1
 
-    try:
-        raw = call_mistral(build_prompt(query))
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "AI service timed out. Please try again."}), 504
-    except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI service error: {e.response.status_code}"}), 502
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"status": "pending"}
 
-    try:
-        competitors = json.loads(strip_fences(raw))
-    except json.JSONDecodeError:
-        return jsonify({"error": "Could not parse AI response", "raw": raw[:500]}), 500
+    t = threading.Thread(target=process_job, args=(job_id, query), daemon=True)
+    t.start()
 
-    if not isinstance(competitors, list):
-        return jsonify({"error": "Unexpected AI response format"}), 500
-
-    return jsonify({
-        "query": query,
-        "competitors": competitors,
-        "total": len(competitors),
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    })
+    return jsonify({"job_id": job_id}), 202
 
 
-# ─── optional: serve your frontend HTML from the same app ────────
-# If you put Competitorsearch.html in the same folder as this file,
-# visiting the root URL will show the page. Otherwise, comment this out.
+@app.route("/rivalscan/result/<job_id>", methods=["GET", "OPTIONS"])
+def get_result(job_id):
+    """Frontend polls this every 3s until status is done or error."""
+    job = _jobs.get(job_id)
+
+    if job is None:
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    if job["status"] == "pending":
+        return jsonify({"status": "pending"}), 202
+
+    if job["status"] == "error":
+        # clean up and return error
+        _jobs.pop(job_id, None)
+        return jsonify({"status": "error", "error": job.get("error", "Unknown error")}), 500
+
+    # done — return result and clean up
+    result = job["result"]
+    _jobs.pop(job_id, None)
+    return jsonify({"status": "done", **result}), 200
+
+
 @app.route("/")
 def serve_frontend():
     try:
-        return send_from_directory(".", "Competitorsearch.html")
+        return send_from_directory(".", "index.html")
     except Exception:
         return jsonify({"status": "RivalScan backend is running"})
 
 
-# ─── start ───────────────────────────────────────────────────────
+# ─── start ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
